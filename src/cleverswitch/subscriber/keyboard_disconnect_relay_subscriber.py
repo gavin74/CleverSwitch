@@ -1,5 +1,8 @@
 import logging
 import os
+import re
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -14,6 +17,39 @@ log = logging.getLogger(__name__)
 PEER_HOST_ENV = "CLEVERSWITCH_PEER_HOST"
 PEER_HOST_FILE = Path.home() / ".config" / "cleverswitch" / "peer_host"
 RELAY_DELAY_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_DELAY", "1.5"))
+RELAY_MAX_IDLE_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_MAX_IDLE", "300"))
+
+
+def _system_idle_seconds() -> float | None:
+    """Seconds since the last local keyboard/mouse input, or None if unknown.
+
+    A real Easy-Switch press happens at an active desk; a power-save link drop
+    happens long after the user left. Unknown fails open (relay proceeds).
+    """
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["/usr/sbin/ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+            m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+            if m:
+                return int(m.group(1)) / 1_000_000_000
+        elif sys.platform == "win32":
+            import ctypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            info = LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return (ctypes.windll.kernel32.GetTickCount() - info.dwTime) / 1000.0
+    except Exception as e:
+        log.debug(f"Idle check failed: {e}")
+    return None
 
 
 def _configured_peer_host() -> int | None:
@@ -35,11 +71,13 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
     over Bluetooth before the link tears down, e.g. MX Keys for Business 0xB380).
 
     A disconnect only counts as a switch if the keyboard stays gone for
-    RELAY_DELAY_SECONDS; a reconnect within the window cancels the relay, so
-    sleep/wake blips and service restarts do not move the mouse. Power-off or
-    battery death still trigger one false relay, recovered with the mouse's
-    channel button. The 0-based target host comes from $CLEVERSWITCH_PEER_HOST
-    or ~/.config/cleverswitch/peer_host; when neither is set the relay is off.
+    RELAY_DELAY_SECONDS (a reconnect within the window cancels the relay) and
+    there was local input within RELAY_MAX_IDLE_SECONDS, so sleep/wake blips,
+    service restarts and the keyboard's own idle power-save drop at an empty
+    desk do not move the mouse. Powering the keyboard off mid-use still
+    triggers one false relay, recovered with the mouse's channel button. The
+    0-based target host comes from $CLEVERSWITCH_PEER_HOST or
+    ~/.config/cleverswitch/peer_host; when neither is set the relay is off.
     """
 
     def __init__(self, device_registry: LogiDeviceRegistry, topics: Topics):
@@ -85,6 +123,14 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
             keyboard = self._device_registry.get_by_wpid(event.wpid)
             if keyboard is None or keyboard.connected or not self._other_connected(event.wpid):
                 return
+
+        idle = _system_idle_seconds()
+        if idle is not None and idle > RELAY_MAX_IDLE_SECONDS:
+            log.info(
+                f"'{keyboard.display_name}' disconnected after {idle:.0f}s without local input; "
+                f"idle drop, not relaying"
+            )
+            return
 
         log.info(
             f"'{keyboard.display_name}' left without announcement; "
