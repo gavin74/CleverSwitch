@@ -18,6 +18,26 @@ PEER_HOST_ENV = "CLEVERSWITCH_PEER_HOST"
 PEER_HOST_FILE = Path.home() / ".config" / "cleverswitch" / "peer_host"
 RELAY_DELAY_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_DELAY", "1.5"))
 RELAY_MAX_IDLE_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_MAX_IDLE", "300"))
+RELAY_ON_BATTERY = os.environ.get("CLEVERSWITCH_RELAY_ON_BATTERY") == "1"
+
+
+def _on_ac_power() -> bool:
+    """True when on mains power (macOS), or anywhere the check does not apply.
+
+    A keyboard link lost while the machine runs on battery means the machine
+    was carried away from the desk, not that the user pressed Easy-Switch at
+    it. Fails open so a broken probe never disables relaying.
+    """
+    if sys.platform != "darwin" or RELAY_ON_BATTERY:
+        return True
+    try:
+        out = subprocess.run(
+            ["/usr/bin/pmset", "-g", "ps"], capture_output=True, text=True, timeout=5
+        ).stdout
+        return "AC Power" in out
+    except Exception as e:
+        log.debug(f"Power check failed: {e}")
+        return True
 
 
 def _system_idle_seconds() -> float | None:
@@ -71,10 +91,12 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
     over Bluetooth before the link tears down, e.g. MX Keys for Business 0xB380).
 
     A disconnect only counts as a switch if the keyboard stays gone for
-    RELAY_DELAY_SECONDS (a reconnect within the window cancels the relay) and
-    there was local input within RELAY_MAX_IDLE_SECONDS, so sleep/wake blips,
-    service restarts and the keyboard's own idle power-save drop at an empty
-    desk do not move the mouse. Powering the keyboard off mid-use still
+    RELAY_DELAY_SECONDS (a reconnect within the window cancels the relay),
+    there was local input within RELAY_MAX_IDLE_SECONDS, and on macOS the
+    machine is on AC power (set CLEVERSWITCH_RELAY_ON_BATTERY=1 to relay on
+    battery too). This keeps sleep/wake blips, service restarts, the
+    keyboard's idle power-save drop and carrying the laptop out of range
+    from moving the mouse. Powering the keyboard off mid-use still
     triggers one false relay, recovered with the mouse's channel button. The
     0-based target host comes from $CLEVERSWITCH_PEER_HOST or
     ~/.config/cleverswitch/peer_host; when neither is set the relay is off.
@@ -129,6 +151,13 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
             log.info(
                 f"'{keyboard.display_name}' disconnected after {idle:.0f}s without local input; "
                 f"idle drop, not relaying"
+            )
+            return
+
+        if not _on_ac_power():
+            log.info(
+                f"'{keyboard.display_name}' disconnected while on battery; "
+                f"machine likely undocked, not relaying"
             )
             return
 
