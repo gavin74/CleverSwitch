@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 PEER_HOST_ENV = "CLEVERSWITCH_PEER_HOST"
 PEER_HOST_FILE = Path.home() / ".config" / "cleverswitch" / "peer_host"
+HOME_NETWORK_FILE = Path.home() / ".config" / "cleverswitch" / "home_network"
 RELAY_DELAY_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_DELAY", "1.5"))
 RELAY_MAX_IDLE_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_MAX_IDLE", "300"))
 RELAY_ON_BATTERY = os.environ.get("CLEVERSWITCH_RELAY_ON_BATTERY") == "1"
@@ -94,6 +95,56 @@ def _system_idle_seconds() -> float | None:
     return None
 
 
+def _gateway_mac() -> str | None:
+    """MAC of the default gateway on a physical interface (macOS).
+
+    Reads the routing table rather than `route get default` because a VPN
+    moves the primary default onto a utun interface, which has no MAC; the
+    LAN default on en* stays in the table and identifies the real router.
+    """
+    try:
+        routes = subprocess.run(
+            ["/usr/sbin/netstat", "-rn", "-f", "inet"], capture_output=True, text=True, timeout=5
+        ).stdout
+        gateway = None
+        for line in routes.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "default" and not parts[-1].startswith("utun"):
+                gateway = parts[1]
+                break
+        if gateway is None:
+            return None
+        arp = subprocess.run(
+            ["/usr/sbin/arp", "-n", gateway], capture_output=True, text=True, timeout=5
+        ).stdout
+        m = re.search(r" at ([0-9a-fA-F:]+) ", arp)
+        if m is None:
+            return None
+        return ":".join(f"{int(part, 16):02x}" for part in m.group(1).split(":"))
+    except Exception as e:
+        log.debug(f"Gateway lookup failed: {e}")
+        return None
+
+
+def _on_home_network() -> bool:
+    """True when the LAN router matches a recorded home router, when no home
+    network is recorded, or when the router cannot be determined (fail open)."""
+    if sys.platform != "darwin" or not HOME_NETWORK_FILE.is_file():
+        return True
+    try:
+        recorded = {
+            line.strip().lower()
+            for line in HOME_NETWORK_FILE.read_text().splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return True
+    if not recorded:
+        return True
+    mac = _gateway_mac()
+    return mac is None or mac in recorded
+
+
 def _configured_peer_host() -> int | None:
     try:
         value = os.environ.get(PEER_HOST_ENV)
@@ -128,7 +179,9 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
     RELAY_MAX_IDLE_SECONDS, and the machine is on AC power (set
     CLEVERSWITCH_RELAY_ON_BATTERY=1 to relay on battery too). This keeps
     sleep/wake blips, service restarts, the keyboard's idle power-save drop
-    and carrying a laptop out of range from moving the mouse. Powering the
+    and carrying a laptop out of range from moving the mouse. When
+    ~/.config/cleverswitch/home_network records router MACs (one per line),
+    the relay additionally stays mute on other networks. Powering the
     keyboard off mid-use still triggers one false relay, recovered with the
     mouse's channel button. The 0-based target host comes from
     $CLEVERSWITCH_PEER_HOST or ~/.config/cleverswitch/peer_host; when neither
@@ -207,6 +260,13 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
             log.info(
                 f"'{keyboard.display_name}' disconnected while on battery; "
                 f"machine likely undocked, not relaying"
+            )
+            return
+
+        if not _on_home_network():
+            log.info(
+                f"'{keyboard.display_name}' disconnected away from the home network; "
+                f"not relaying"
             )
             return
 
