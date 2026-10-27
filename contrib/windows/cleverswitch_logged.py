@@ -9,7 +9,10 @@ try:
         os.replace(log_path, log_path + ".1")
 except OSError:
     pass
-sys.stdout = sys.stderr = open(log_path, "a", buffering=1, encoding="utf-8")
+try:
+    sys.stdout = sys.stderr = open(log_path, "a", buffering=1, encoding="utf-8")
+except OSError:
+    pass  # run without redirection rather than crash-loop the scheduled task
 
 from cleverswitch.cli.cli_module import main
 

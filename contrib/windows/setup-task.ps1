@@ -19,7 +19,9 @@ else { Write-Warning "hidapi.dll missing from $scripts and no backup at $backup"
 $wrapper = Join-Path $env:USERPROFILE "cleverswitch_logged.py"
 Copy-Item (Join-Path $PSScriptRoot "cleverswitch_logged.py") $wrapper -Force
 
-Get-Process pythonw, cleverswitch -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process pythonw, cleverswitch -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path -like "$toolDir*" } |
+    Stop-Process -Force
 
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$wrapper`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
