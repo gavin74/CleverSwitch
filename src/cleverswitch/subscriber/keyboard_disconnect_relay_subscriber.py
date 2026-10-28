@@ -8,7 +8,14 @@ from pathlib import Path
 
 from ..event.device_connected_event import DeviceConnectedEvent
 from ..event.host_change_event import HostChangeEvent
-from ..hidpp.constants import HOST_SWITCH_CIDS
+from ..event.write_event import WriteEvent
+from ..hidpp.constants import (
+    CHANGE_HOST_FN_SET,
+    FEATURE_CHANGE_HOST,
+    HOST_SWITCH_CIDS,
+    SW_ID_HOST_CHANGE,
+)
+from ..hidpp.protocol import build_msg, pack_params
 from ..registry.logi_device_registry import LogiDeviceRegistry
 from ..subscriber.subscriber import Subscriber
 from ..topic.topics import Topics
@@ -18,9 +25,11 @@ log = logging.getLogger(__name__)
 PEER_HOST_ENV = "CLEVERSWITCH_PEER_HOST"
 PEER_HOST_FILE = Path.home() / ".config" / "cleverswitch" / "peer_host"
 HOME_NETWORK_FILE = Path.home() / ".config" / "cleverswitch" / "home_network"
+BOUNCE_FILE = Path.home() / ".config" / "cleverswitch" / "bounce_followers"
 RELAY_DELAY_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_DELAY", "1.5"))
 RELAY_MAX_IDLE_SECONDS = float(os.environ.get("CLEVERSWITCH_RELAY_MAX_IDLE", "300"))
 RELAY_ON_BATTERY = os.environ.get("CLEVERSWITCH_RELAY_ON_BATTERY") == "1"
+BOUNCE_GRACE_SECONDS = float(os.environ.get("CLEVERSWITCH_BOUNCE_GRACE", "90"))
 VALID_HOSTS = frozenset(HOST_SWITCH_CIDS.values())
 
 
@@ -168,6 +177,25 @@ def _configured_peer_host() -> int | None:
     return host
 
 
+def _bounce_wpids() -> set[int]:
+    """Follower wpids that may be sent home when no keyboard is present.
+
+    One wpid per line (hex like 0xB035 or decimal). Listing devices explicitly
+    keeps a host's own dedicated mouse out of the bounce logic."""
+    try:
+        if not BOUNCE_FILE.is_file():
+            return set()
+        wpids = set()
+        for line in BOUNCE_FILE.read_text().splitlines():
+            line = line.strip()
+            if line:
+                wpids.add(int(line, 0))
+        return wpids
+    except (OSError, ValueError) as e:
+        log.warning(f"Ignoring bounce config {BOUNCE_FILE}: {e}")
+        return set()
+
+
 class KeyboardDisconnectRelaySubscriber(Subscriber):
     """Relays Easy-Switch to the remaining devices when the keyboard drops
     without a CHANGE_HOST announcement (firmware that never delivers x1814
@@ -177,28 +205,42 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
     RELAY_DELAY_SECONDS (a reconnect or a real x1814 announcement within the
     window cancels the relay), there was local input within
     RELAY_MAX_IDLE_SECONDS, and the machine is on AC power (set
-    CLEVERSWITCH_RELAY_ON_BATTERY=1 to relay on battery too). This keeps
-    sleep/wake blips, service restarts, the keyboard's idle power-save drop
-    and carrying a laptop out of range from moving the mouse. When
+    CLEVERSWITCH_RELAY_ON_BATTERY=1 to relay on battery too). When
     ~/.config/cleverswitch/home_network records router MACs (one per line),
-    the relay additionally stays mute on other networks. Powering the
+    the relay additionally stays mute on other networks. This keeps
+    sleep/wake blips, service restarts, the keyboard's idle power-save drop
+    and carrying a laptop out of range from moving the mouse. Powering the
     keyboard off mid-use still triggers one false relay, recovered with the
     mouse's channel button. The 0-based target host comes from
     $CLEVERSWITCH_PEER_HOST or ~/.config/cleverswitch/peer_host; when neither
     is set the relay is off.
+
+    Bounce: a follower listed in ~/.config/cleverswitch/bounce_followers that
+    is connected while no keyboard is, for BOUNCE_GRACE_SECONDS, is sent to
+    the peer host by itself. This self-heals the strand where a relay (or a
+    failed keyboard attach on the other machine) parks the shared mouse on a
+    host the keyboard never reached. Only listed wpids are ever bounced.
     """
 
     def __init__(self, device_registry: LogiDeviceRegistry, topics: Topics):
         self._device_registry = device_registry
         self._topics = topics
         self._peer_host = _configured_peer_host()
+        self._bounce_wpids = _bounce_wpids()
         self._timers: dict[int, threading.Timer] = {}
+        self._bounce_timers: dict[int, threading.Timer] = {}
         self._lock = threading.Lock()
         if self._peer_host is None:
             return
+        bounce_note = (
+            f", bouncing {sorted(hex(w) for w in self._bounce_wpids)} after "
+            f"{BOUNCE_GRACE_SECONDS:.0f}s without a keyboard"
+            if self._bounce_wpids
+            else ""
+        )
         log.info(
             f"Keyboard disconnect relay armed: peer host {self._peer_host + 1}, "
-            f"delay {RELAY_DELAY_SECONDS}s"
+            f"delay {RELAY_DELAY_SECONDS}s{bounce_note}"
         )
         topics.hid_event.subscribe(self)
 
@@ -211,7 +253,11 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
             return
 
         device = self._device_registry.get_by_wpid(event.wpid)
-        if device is None or device.role != "keyboard":
+        if device is None:
+            return
+
+        if device.role != "keyboard":
+            self._track_follower(event, device)
             return
 
         with self._lock:
@@ -220,6 +266,7 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
                 timer.cancel()
 
             if event.link_established:
+                self._cancel_bounces_locked()
                 return
 
             if not self._followers_connected(event.wpid):
@@ -240,6 +287,41 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
                     if timer is not None:
                         timer.cancel()
                 return
+
+    def _track_follower(self, event: DeviceConnectedEvent, device) -> None:
+        if event.wpid not in self._bounce_wpids:
+            return
+        with self._lock:
+            timer = self._bounce_timers.pop(event.wpid, None)
+            if timer is not None:
+                timer.cancel()
+            if not event.link_established or self._keyboard_connected():
+                return
+            timer = threading.Timer(BOUNCE_GRACE_SECONDS, self._bounce, args=(event.wpid,))
+            timer.daemon = True
+            self._bounce_timers[event.wpid] = timer
+            timer.start()
+        log.info(
+            f"'{device.display_name}' connected with no keyboard present; sending it to "
+            f"host {self._peer_host + 1} in {BOUNCE_GRACE_SECONDS:.0f}s unless one arrives"
+        )
+
+    def _bounce(self, wpid: int) -> None:
+        with self._lock:
+            self._bounce_timers.pop(wpid, None)
+            device = self._device_registry.get_by_wpid(wpid)
+            if device is None or not device.connected or self._keyboard_connected():
+                return
+        change_host_idx = device.available_features.get(FEATURE_CHANGE_HOST)
+        if change_host_idx is None:
+            return
+        log.info(
+            f"'{device.display_name}' still has no keyboard with it; "
+            f"sending it alone to host {self._peer_host + 1}"
+        )
+        request_id = (change_host_idx << 8) | (CHANGE_HOST_FN_SET & 0xF0) | SW_ID_HOST_CHANGE
+        msg = build_msg(device.slot, request_id, pack_params((self._peer_host,)))
+        self._topics.write.publish(WriteEvent(slot=device.slot, pid=device.pid, hid_message=msg))
 
     def _relay(self, event: DeviceConnectedEvent) -> None:
         with self._lock:
@@ -289,3 +371,13 @@ class KeyboardDisconnectRelaySubscriber(Subscriber):
             for d in self._device_registry.all_entries()
             if d.wpid != keyboard_wpid and d.role != "keyboard"
         )
+
+    def _keyboard_connected(self) -> bool:
+        return any(
+            d.connected for d in self._device_registry.all_entries() if d.role == "keyboard"
+        )
+
+    def _cancel_bounces_locked(self) -> None:
+        for timer in self._bounce_timers.values():
+            timer.cancel()
+        self._bounce_timers.clear()
